@@ -1,0 +1,745 @@
+import cv2
+from ultralytics import YOLO
+import sqlite3
+from datetime import datetime
+import os
+import threading
+from flask import Flask, render_template_string, request, redirect, url_for, Response, stream_with_context
+import time  # For sleeping during reconnect attempts
+import base64
+
+# NEW: OCR
+import pytesseract
+import re
+
+# ----------------------------------------------------------------
+# If you're on Windows and Tesseract isn't on PATH, UNCOMMENT and
+# set this to your installed location, e.g.:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# ----------------------------------------------------------------
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# -----------------------------
+# Config
+# -----------------------------
+MODEL_PATH = "yolov8n.pt"
+WINDOW_TITLE = "Smart Asset Surveillance"
+
+TRACKABLE_CLASSES = ["chair", "monitor", "keyboard", "laptop", "cup", "bowl", "tv", "mouse", "book", "cell phone"]
+USE_CLASS_FILTER = True
+
+IOU_SAME_OBJECT = 0.80
+IOU_PRESENCE = 0.50
+ABSENT_CONSEC_FRAMES = 15   # ⚡ changed from 45 -> faster (~0.5s at ~30FPS)
+OCCLUSION_FG_RATIO = 0.15
+WARMUP_FRAMES_BG = 60
+
+DB_PATH = "events.db"
+
+# Global state for video processing
+camera = None
+model = None
+baseline = []
+baseline_ready = False
+bg = None
+
+# Global variable to hold the current stream URL or "webcam"
+RTSP_URL = None
+
+# Lock to protect shared resources if multiple clients connect
+# For a single stream this is not strictly needed but is good practice.
+frame_lock = threading.Lock()
+current_frame = None
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def iou_xywh(a, b):
+    x1A, y1A, w1A, h1A = a
+    x2A, y2A = x1A + w1A, y1A + h1A
+    x1B, y1B, w1B, h1B = b
+    x2B, y2B = x1B + w1B, y1B + h1B
+    x1i = max(x1A, x1B)
+    y1i = max(y1A, y1B)
+    x2i = min(x2A, x2B)
+    y2i = min(y2A, y2B)
+    iw = max(0, x2i - x1i)
+    ih = max(0, y2i - y1i)
+    inter = iw * ih
+    ua = w1A * h1A + w1B * h1B - inter
+    return inter / ua if ua > 0 else 0.0
+
+def draw_box(frame, xywh, label, color=(0,255,0)):
+    x, y, w, h = xywh
+    p1 = (int(x - w/2), int(y - h/2))
+    p2 = (int(x + w/2), int(y + h/2))
+    cv2.rectangle(frame, p1, p2, color, 2)
+    cv2.putText(frame, label, (p1[0], p1[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+def extract_detections(frame, model):
+    results = model(frame, verbose=False)
+    dets = []
+    if len(results) and results[0].boxes is not None:
+        boxes = results[0].boxes.xywh
+        cids = results[0].boxes.cls
+        confs = results[0].boxes.conf
+        for box, cid, conf in zip(boxes, cids, confs):
+            xc, yc, w, h = [float(v) for v in box]
+            label = results[0].names[int(cid)]
+            dets.append((xc, yc, w, h, label, float(conf)))
+    return dets
+
+def count_by_label(objs):
+    counts = {}
+    for _, _, _, _, lbl, _ in objs:
+        counts[lbl] = counts.get(lbl, 0) + 1
+    return counts
+
+def draw_counts(frame, counts):
+    y = 30
+    x = frame.shape[1] - 300
+    for lbl in sorted(counts.keys()):
+        cv2.putText(frame, f"{lbl}: {counts[lbl]}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+        y += 26
+
+def clamp_box_to_frame(xywh, shape):
+    H, W = shape[:2]
+    x, y, w, h = xywh
+    x1, y1 = int(max(0, x - w/2)), int(max(0, y - h/2))
+    x2, y2 = int(min(W-1, x + w/2)), int(min(H-1, y + h/2))
+    return x1, y1, x2, y2
+
+# -------- OCR: read sticker numbers from a crop --------
+def read_sticker_number(frame, xywh):
+    """
+    Returns a numeric string like '12' if found, else ''.
+    Tries to be robust with simple preprocessing.
+    """
+    x1, y1, x2, y2 = clamp_box_to_frame(xywh, frame.shape)
+    roi = frame[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
+    if roi.size == 0:
+        return ""
+
+    # Heuristic: focus on top-middle area where a sticker is likely to be
+    h, w = roi.shape[:2]
+    top = 0
+    bottom = max(1, int(h * 0.45)) # top ~45%
+    left = int(w * 0.25)
+    right = int(w * 0.75)
+    crop = roi[top:bottom, left:right]
+    if crop.size == 0:
+        crop = roi # fallback to full roi
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # Upscale for better OCR
+    scale = max(1, int(200 / max(1, min(crop.shape[0], crop.shape[1]))))
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # Contrast/threshold
+    gray = cv2.bilateralFilter(gray, 7, 50, 50)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # digits-only OCR
+    txt = pytesseract.image_to_string(
+        th, config="--psm 7 -c tessedit_char_whitelist=0123456789"
+    )
+    digits = re.sub(r"[^\d]", "", txt)
+    # If nothing in top area, try whole ROI quickly
+    if not digits:
+        gray2 = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.resize(gray2, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+        _, th2 = cv2.threshold(gray2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        txt2 = pytesseract.image_to_string(
+            th2, config="--psm 7 -c tessedit_char_whitelist=0123456789"
+        )
+        digits = re.sub(r"[^\d]", "", txt2)
+
+    # Keep it reasonable (e.g., 1–4 digits)
+    if 1 <= len(digits) <= 4:
+        return digits
+    return ""
+
+# -----------------------------
+# Database
+# -----------------------------
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS baseline_objects (
+            object_id INTEGER PRIMARY KEY,
+            label TEXT,
+            x REAL, y REAL, w REAL, h REAL
+        )
+    """)
+    # Add new column for image data if it doesn't exist
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            event TEXT,
+            object_id INTEGER,
+            label TEXT,
+            details TEXT,
+            image_data TEXT -- NEW: Column for storing base64 image data
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS current_status (
+            object_id INTEGER PRIMARY KEY,
+            label TEXT,
+            missing INTEGER,
+            missing_since TEXT
+        )
+    """)
+    # Try to add image_data column to events table, ignore if it exists
+    try:
+        cur.execute("ALTER TABLE events ADD COLUMN image_data TEXT")
+        print("Added 'image_data' column to events table.")
+    except sqlite3.OperationalError:
+        # This error is expected if the column already exists
+        pass
+
+    con.commit()
+    return con
+
+def upsert_status(con, obj_id, label, missing, missing_since):
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO current_status (object_id, label, missing, missing_since)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(object_id) DO UPDATE SET
+            label=excluded.label,
+            missing=excluded.missing,
+            missing_since=excluded.missing_since
+    """, (obj_id, label, int(missing), missing_since))
+    con.commit()
+
+def insert_event(con, event, object_id, label, details="", image_data=None):
+    cur = con.cursor()
+    cur.execute("INSERT INTO events (ts, event, object_id, label, details, image_data) VALUES (?, ?, ?, ?, ?, ?)",
+                (now_str(), event, object_id, label, details, image_data))
+    con.commit()
+
+# NEW: Function to clear the image from the missing event
+def clear_missing_event_image(con, object_id):
+    cur = con.cursor()
+    # Find the most recent MISSING event for this object_id and clear its image data
+    cur.execute("""
+        UPDATE events
+        SET image_data = NULL
+        WHERE id = (
+            SELECT id FROM events
+            WHERE object_id = ? AND event = 'MISSING'
+            ORDER BY ts DESC LIMIT 1
+        )
+    """, (object_id,))
+    con.commit()
+
+def save_baseline_to_db(con, baseline):
+    cur = con.cursor()
+    cur.execute("DELETE FROM baseline_objects")
+    for obj in baseline:
+        x,y,w,h = obj["box"]
+        cur.execute("INSERT INTO baseline_objects (object_id, label, x, y, w, h) VALUES (?, ?, ?, ?, ?, ?)",
+                    (obj["id"], obj["display_label"], x, y, w, h))
+        upsert_status(con, obj["id"], obj["display_label"], 0, None)
+    con.commit()
+
+# -----------------------------
+# Flask Dashboard
+# -----------------------------
+app = Flask(__name__)
+TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asset Surveillance Dashboard</title>
+    <meta http-equiv="refresh" content="5">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.9);
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            margin: auto;
+            display: block;
+            width: 80%;
+            max-width: 900px;
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen p-6 md:p-12">
+    <div class="max-w-7xl mx-auto">
+        <header class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 mb-8">
+            <h1 class="text-3xl font-bold tracking-tight text-indigo-400">Asset Surveillance</h1>
+            <div class="flex flex-col md:flex-row items-center gap-4">
+                <a href="{{ url_for('show_stream') }}" class="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-6 py-2 text-base font-semibold text-white shadow-lg transition-colors hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-slate-950">
+                    View Live Stream
+                </a>
+                <form method="POST" action="{{ url_for('clear_db') }}" onsubmit="return confirm('Are you sure you want to clear all events and status? This cannot be undone.');">
+                    <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-red-600 px-6 py-2 text-base font-semibold text-white shadow-lg transition-colors hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-slate-950">
+                        Clear Events
+                    </button>
+                </form>
+            </div>
+        </header>
+
+        <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Configuration Panel -->
+            <div class="bg-slate-900 rounded-xl shadow-lg p-6 lg:col-span-1">
+                <h2 class="text-xl font-semibold mb-4 text-slate-100">Configure Stream</h2>
+                <form method="POST" action="{{ url_for('set_stream') }}" class="mb-4">
+                    <label for="rtsp_url" class="block text-sm font-medium text-slate-400 mb-1">RTSP URL</label>
+                    <input type="text" id="rtsp_url" name="rtsp_url" value="{{ rtsp_url if rtsp_url != 'webcam' else 'rtsp://user:password@ip:port/stream' }}" required class="block w-full rounded-md border-gray-700 bg-slate-800 px-3 py-2 text-slate-100 placeholder-slate-400 focus:border-indigo-500 focus:ring-indigo-500 shadow-sm sm:text-sm">
+                    <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 mt-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500">
+                        Start RTSP Stream
+                    </button>
+                </form>
+                <form method="POST" action="{{ url_for('set_webcam') }}">
+                    <button type="submit" class="w-full rounded-md bg-gray-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-gray-500">
+                        Use Webcam
+                    </button>
+                </form>
+            </div>
+
+            <!-- Current Status & Recent Events -->
+            <div class="lg:col-span-2 space-y-6">
+                <!-- Current Status Table -->
+                <div class="bg-slate-900 rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-semibold mb-4 text-slate-100">Current Status</h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full table-auto">
+                            <thead>
+                                <tr class="bg-slate-800 text-slate-400 uppercase text-sm leading-normal">
+                                    <th class="py-3 px-6 text-left rounded-tl-lg">ID</th>
+                                    <th class="py-3 px-6 text-left">Label</th>
+                                    <th class="py-3 px-6 text-left">Status</th>
+                                    <th class="py-3 px-6 text-left rounded-tr-lg">Missing Since</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-slate-300 text-sm font-light">
+                                {% for row in status %}
+                                <tr class="border-b border-slate-700 hover:bg-slate-800">
+                                    <td class="py-3 px-6">{{ row['object_id'] }}</td>
+                                    <td class="py-3 px-6">{{ row['label'] }}</td>
+                                    {% if row['missing'] %}
+                                        <td class="py-3 px-6"><span class="bg-red-700 text-red-100 text-xs font-semibold px-2 py-1 rounded-full uppercase">Missing</span></td>
+                                    {% else %}
+                                        <td class="py-3 px-6"><span class="bg-green-700 text-green-100 text-xs font-semibold px-2 py-1 rounded-full uppercase">OK</span></td>
+                                    {% endif %}
+                                    <td class="py-3 px-6">{{ row['missing_since'] or '-' }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Recent Events Table -->
+                <div class="bg-slate-900 rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-semibold mb-4 text-slate-100">Recent Events</h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full table-auto">
+                            <thead>
+                                <tr class="bg-slate-800 text-slate-400 uppercase text-sm leading-normal">
+                                    <th class="py-3 px-6 text-left rounded-tl-lg">Time</th>
+                                    <th class="py-3 px-6 text-left">Event</th>
+                                    <th class="py-3 px-6 text-left">Object ID</th>
+                                    <th class="py-3 px-6 text-left">Label</th>
+                                    <th class="py-3 px-6 text-left">Details</th>
+                                    <th class="py-3 px-6 text-center rounded-tr-lg">Image</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-slate-300 text-sm font-light">
+                                {% for e in events %}
+                                <tr class="border-b border-slate-700 hover:bg-slate-800">
+                                    <td class="py-3 px-6">{{ e['ts'] }}</td>
+                                    {% if e['event'] == 'MISSING' %}
+                                        <td class="py-3 px-6 text-red-400 font-medium">{{ e['event'] }}</td>
+                                    {% elif e['event'] == 'OUT_OF_PLACE' %}
+                                        <td class="py-3 px-6 text-amber-400 font-medium">{{ e['event'] }}</td>
+                                    {% else %}
+                                        <td class="py-3 px-6 text-green-400 font-medium">{{ e['event'] }}</td>
+                                    {% endif %}
+                                    <td class="py-3 px-6">{{ e['object_id'] }}</td>
+                                    <td class="py-3 px-6">{{ e['label'] }}</td>
+                                    <td class="py-3 px-6">{{ e['details'] }}</td>
+                                    <!-- NEW: Image column -->
+                                    <td class="py-3 px-6 text-center">
+                                        {% if e['image_data'] %}
+                                            <button onclick="showImageModal('{{ e['image_data'] }}')" class="text-slate-400 hover:text-indigo-400 transition-colors">
+                                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 015.137 5.14M6.827 6.175A2.31 2.31 0 0110.513 5.378M6.827 6.175C7.29 5.862 7.82 5.678 8.4 5.617M10.513 5.378A2.31 2.31 0 0114.199 5.14M10.513 5.378C11.1 5.242 11.8 5.132 12.5 5.132C13.2 5.132 13.9 5.242 14.587 5.378M14.199 5.14A2.31 2.31 0 0117.885 6.175M14.199 5.14A2.31 2.31 0 0118.863 7.863M17.885 6.175A2.31 2.31 0 0118.863 7.863M17.885 6.175C18.45 6.516 19.03 6.907 19.6 7.352M18.863 7.863A2.31 2.31 0 0120.441 11.55M18.863 7.863A2.31 2.31 0 0121.571 14.148M20.441 11.55C20.65 11.88 20.9 12.2 21.14 12.515M21.571 14.148A2.31 2.31 0 0121.14 12.515M21.571 14.148C22.18 14.93 22.75 15.75 23.27 16.59M21.14 12.515A2.31 2.31 0 0118.995 13.626M18.995 13.626A2.31 2.31 0 0118.863 7.863M18.995 13.626C18.49 14.28 17.9 14.99 17.25 15.75M17.25 15.75A2.31 2.31 0 0114.199 15.152M17.25 15.75A2.31 2.31 0 0113.885 16.518M14.199 15.152A2.31 2.31 0 0112.5 15.75M14.199 15.152C13.52 14.88 12.82 14.7 12.1 14.7M12.5 15.75A2.31 2.31 0 019.801 16.518M12.5 15.75C11.8 15.75 11.1 15.65 10.4 15.488M9.801 16.518A2.31 2.31 0 016.827 16.175M9.801 16.518C9.22 16.88 8.63 17.27 8.04 17.652M6.827 16.175A2.31 2.31 0 015.319 19.863M6.827 16.175C6.18 16.54 5.54 16.92 4.9 17.3M5.319 19.863A2.31 2.31 0 014.215 17.22M5.319 19.863C4.65 20.37 4 20.95 3.39 21.571M4.215 17.22A2.31 2.31 0 013.069 15.933M4.215 17.22C3.65 17.7 3.05 18.23 2.5 18.8M3.069 15.933A2.31 2.31 0 012.35 14.65M3.069 15.933C2.55 15.35 2.05 14.75 1.6 14.14M2.35 14.65A2.31 2.31 0 012.35 12.55M2.35 14.65C2.15 13.9 2.05 13.2 2.05 12.5M2.35 12.55A2.31 2.31 0 014.215 12.22M2.35 12.55C2.55 11.8 2.8 11.1 3.069 10.45M4.215 12.22A2.31 2.31 0 016.827 12.675M4.215 12.22C4.78 12.25 5.35 12.2 5.95 12.1M6.827 12.675A2.31 2.31 0 009.801 12.918M6.827 12.675C7.45 13.02 8.08 13.25 8.7 13.43M9.801 12.918A2.31 2.31 0 0112.5 13.55M9.801 12.918C10.4 13.58 11.1 14.18 11.75 14.75" />
+                                                </svg>
+                                            </button>
+                                        {% else %}
+                                            <span class="text-slate-600">-</span>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- The Modal -->
+    <div id="imageModal" class="modal" onclick="this.style.display='none'">
+        <img class="modal-content" id="modalImage">
+    </div>
+
+    <script>
+        function showImageModal(imageData) {
+            const modal = document.getElementById("imageModal");
+            const modalImage = document.getElementById("modalImage");
+            modalImage.src = "data:image/jpeg;base64," + imageData;
+            modal.style.display = "flex";
+        }
+    </script>
+</body>
+</html>
+"""
+# NEW: Simple template for a dedicated stream page
+STREAM_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Stream</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-950 flex flex-col items-center justify-center h-screen p-4">
+    <div class="relative w-full h-full max-w-7xl max-h-[90vh] rounded-xl overflow-hidden shadow-2xl">
+        <img src="{{ url_for('video_feed') }}" class="w-full h-full object-contain" alt="Live Stream">
+        <a href="{{ url_for('index') }}" class="absolute top-4 left-4 inline-flex items-center justify-center rounded-full bg-slate-800/50 backdrop-blur-sm p-3 text-white transition-colors hover:bg-slate-700/70">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+            </svg>
+        </a>
+    </div>
+</body>
+</html>
+"""
+
+def dict_rows(cur):
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+@app.route("/", methods=["GET"])
+def index():
+    if not os.path.exists(DB_PATH):
+        init_db()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT object_id, label, missing, COALESCE(missing_since,'') as missing_since FROM current_status ORDER BY object_id")
+    status = dict_rows(cur)
+    cur.execute("SELECT id, ts, event, object_id, label, COALESCE(details,'') as details, image_data FROM events ORDER BY id DESC LIMIT 100")
+    events = dict_rows(cur)
+    con.close()
+    return render_template_string(TEMPLATE, status=status, events=events, rtsp_url=RTSP_URL)
+
+# NEW: Route for the dedicated stream page
+@app.route("/stream", methods=["GET"])
+def show_stream():
+    return render_template_string(STREAM_TEMPLATE)
+
+@app.route("/clear", methods=["POST"])
+def clear_db():
+    if os.path.exists(DB_PATH):
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("DELETE FROM events")
+        cur.execute("DELETE FROM current_status")
+        con.commit()
+        con.close()
+    return redirect(url_for('index'))
+
+@app.route("/set_stream", methods=["POST"])
+def set_stream():
+    global RTSP_URL, camera, baseline, baseline_ready, bg
+    new_url = request.form.get("rtsp_url")
+    if not new_url:
+        return redirect(url_for('index', error="RTSP URL cannot be empty."))
+
+    # Reset state for new stream
+    RTSP_URL = new_url
+    if camera:
+        camera.release()
+    camera = None
+    baseline = []
+    baseline_ready = False
+    bg = None
+    return redirect(url_for('index'))
+
+@app.route("/set_webcam", methods=["POST"])
+def set_webcam():
+    global RTSP_URL, camera, baseline, baseline_ready, bg
+    
+    # Reset state for webcam
+    RTSP_URL = "webcam"
+    if camera:
+        camera.release()
+    camera = None
+    baseline = []
+    baseline_ready = False
+    bg = None
+    return redirect(url_for('index'))
+
+def generate_frames():
+    global camera, model, baseline, baseline_ready, bg
+
+    if model is None:
+        model = YOLO(MODEL_PATH)
+    
+    # Initialize the background subtractor only once
+    if bg is None:
+        bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
+    
+    con = init_db()
+    next_id = 1
+    stable_frames = 0
+    bg_warm = 0
+
+    while True:
+        # Check if the camera needs to be initialized or re-initialized
+        if camera is None or not camera.isOpened():
+            if camera:
+                camera.release()
+            
+            try:
+                if RTSP_URL == "webcam":
+                    # We'll use index 1 as a common path for an external camera.
+                    # If this still doesn't work, try changing the number
+                    # to 2, 3, etc. to find the correct camera.
+                    camera = cv2.VideoCapture(1) 
+                else:
+                    camera = cv2.VideoCapture(RTSP_URL)
+                
+                # If connection fails, generate an error frame and wait before retrying
+                if not camera.isOpened():
+                    print("Failed to open video stream. Retrying in 5 seconds...")
+                    error_frame = cv2.imread("https://placehold.co/960x540/000000/FFFFFF?text=Error%3A+Camera+Disconnected")
+                    # If cv2 can't read the placeholder URL, generate a plain image
+                    if error_frame is None:
+                        error_frame = 255 * np.ones((540, 960, 3), dtype=np.uint8)
+                        cv2.putText(error_frame, "Error: Camera Disconnected", (30, 270), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
+                    ret, buffer = cv2.imencode('.jpg', error_frame)
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    time.sleep(5)
+                    continue
+                else:
+                    print("Stream reconnected successfully.")
+            except Exception as e:
+                print(f"Error during reconnection: {e}")
+                time.sleep(5)
+                continue
+
+        ok, frame = camera.read()
+        if not ok:
+            print("Failed to read frame. Dropping and re-attempting read.")
+            continue # Try to read the next frame immediately
+
+        fgmask = bg.apply(frame)
+        bg_warm += 1
+        detections = extract_detections(frame, model)
+        if USE_CLASS_FILTER:
+            detections = [d for d in detections if d[4] in TRACKABLE_CLASSES]
+
+        # -------- Baseline building --------
+        if not baseline_ready:
+            new_added = False
+            for xc, yc, w, h, lbl, conf in detections:
+                box = (xc, yc, w, h)
+                duplicate = any(iou_xywh(box, b["box"]) > IOU_SAME_OBJECT for b in baseline)
+                if not duplicate:
+                    # NEW: try to read sticker number and augment label
+                    sticker = read_sticker_number(frame, box)
+                    display_label = f"{lbl} #{sticker}" if sticker else lbl
+
+                    baseline.append({
+                        "id": next_id, # internal ID (kept same for DB)
+                        "label": lbl, # class label
+                        "display_label": display_label, # label shown + stored
+                        "sticker": sticker, # OCR digits ('' if none)
+                        "box": box,
+                        "absent": 0,
+                        "missing": False,
+                        "missing_since": None,
+                        "occluded": False,            # NEW: occlusion flag
+                        "occluded_since": None        # NEW: occlusion timestamp
+                    })
+                    draw_box(frame, box, f"Secured: (ID: {next_id}) {display_label}", (0,255,0))
+                    next_id += 1
+                    new_added = True
+
+            stable_frames = 0 if new_added else (stable_frames + 1)
+            if stable_frames > 30 and bg_warm > WARMUP_FRAMES_BG:
+                baseline_ready = True
+                save_baseline_to_db(con, baseline)
+
+            cv2.putText(frame, "Securing baseline objects...", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+
+        # -------- Monitoring --------
+        else:
+            present_baseline_ids = set()
+            new_detections_by_label = {}
+            for det_idx, det in enumerate(detections):
+                xc, yc, w, h, lbl, conf = det
+                found_match = False
+                for obj in baseline:
+                    if iou_xywh(obj["box"], (xc, yc, w, h)) > IOU_PRESENCE:
+                        present_baseline_ids.add(obj["id"])
+                        found_match = True
+                        break
+                if not found_match:
+                    # This is a new, un-baselined object
+                    if lbl not in new_detections_by_label:
+                        new_detections_by_label[lbl] = []
+                    new_detections_by_label[lbl].append(det)
+
+            # Process each baseline object
+            for obj in baseline:
+                is_present = obj["id"] in present_baseline_ids
+                is_occluded = False
+
+                if not is_present:
+                    x1, y1, x2, y2 = clamp_box_to_frame(obj["box"], frame.shape)
+                    roi_mask = fgmask[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
+                    if roi_mask.size > 0:
+                        fg_ratio = (roi_mask > 0).sum() / float(roi_mask.size)
+                        is_occluded = fg_ratio >= OCCLUSION_FG_RATIO
+                
+                is_out_of_place = not is_present and not is_occluded and obj["label"] in new_detections_by_label
+
+                # Use a consistent label format with ID number
+                base_label = f"(ID: {obj['id']}) {obj['display_label']}"
+
+                if is_present:
+                    # If object was previously occluded, clear occluded flag (no DB flood)
+                    if obj.get("occluded"):
+                        obj["occluded"] = False
+                        obj["occluded_since"] = None
+                    if obj["missing"]:
+                        details = ""
+                        if obj["missing_since"]:
+                            try:
+                                t0 = datetime.strptime(obj["missing_since"], "%Y-%m-%d %H:%M:%S")
+                                sec = (datetime.now() - t0).total_seconds()
+                                details = f"restored after {sec:.1f}s"
+                            except:
+                                details = "restored"
+                        insert_event(con, "RESTORED", obj["id"], obj["display_label"], details)
+                        # NEW: Clear the image data from the missing event
+                        clear_missing_event_image(con, obj["id"])
+
+                    obj["absent"] = 0
+                    obj["missing"] = False
+                    obj["missing_since"] = None
+                    upsert_status(con, obj["id"], obj["display_label"], 0, None)
+                    draw_box(frame, obj["box"], base_label, (0,255,0))
+                elif is_occluded:
+                    # Only insert OCCLUDED event once at transition
+                    if not obj.get("occluded", False):
+                        obj["occluded"] = True
+                        obj["occluded_since"] = now_str()
+                        # Capture occlusion evidence (one snapshot)
+                        is_ok, buffer = cv2.imencode('.jpg', frame)
+                        img_as_text = base64.b64encode(buffer).decode('utf-8') if is_ok else None
+                        insert_event(con, "OCCLUDED", obj["id"], obj["display_label"], "object is occluded", image_data=img_as_text)
+                    draw_box(frame, obj["box"], f"{base_label} (occluded)", (0,165,255))
+                elif is_out_of_place:
+                    if not obj["missing"]:
+                        obj["missing"] = True
+                        obj["missing_since"] = now_str()
+                        # Capture out-of-place evidence (one snapshot)
+                        is_ok, buffer = cv2.imencode('.jpg', frame)
+                        img_as_text = base64.b64encode(buffer).decode('utf-8') if is_ok else None
+                        insert_event(con, "OUT_OF_PLACE", obj["id"], obj["display_label"], "object of same type detected elsewhere", image_data=img_as_text)
+                        upsert_status(con, obj["id"], obj["display_label"], 1, obj["missing_since"])
+                    draw_box(frame, obj["box"], f"{base_label} Out of Place!", (0,165,255))
+                else:
+                    obj["absent"] += 1
+                    if (not obj["missing"]) and obj["absent"] >= ABSENT_CONSEC_FRAMES:
+                        obj["missing"] = True
+                        obj["missing_since"] = now_str()
+                        # Capture and save the image when object goes missing
+                        is_ok, buffer = cv2.imencode('.jpg', frame)
+                        img_as_text = base64.b64encode(buffer).decode('utf-8') if is_ok else None
+
+                        insert_event(con, "MISSING", obj["id"], obj["display_label"],
+                                     f"since={obj['missing_since']}", image_data=img_as_text)
+                        
+                        upsert_status(con, obj["id"], obj["display_label"], 1, obj["missing_since"])
+                    
+                    color = (0,0,255) if obj["missing"] else (0,165,255)
+                    label = f"{base_label} {'Missing!' if obj['missing'] else 'Unstable'}"
+                    draw_box(frame, obj["box"], label, color)
+
+                    if obj["missing"] and obj["missing_since"]:
+                        x, y, w, h = obj["box"]
+                        p = (int(x - w/2), int(y - h/2) - 35)
+                        cv2.putText(frame, f"since {obj['missing_since'].split(' ')[1]}", p,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+            
+            # Draw boxes for new detections
+            for lbl, dets in new_detections_by_label.items():
+                for det in dets:
+                    draw_box(frame, det[0:4], f"NEW {det[4]}", (255,255,0))
+    
+            # Live counts + detections overlay
+            draw_counts(frame, count_by_label(detections))
+            
+    
+        ret, buffer = cv2.imencode('.jpg', frame)
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(stream_with_context(generate_frames()), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/release_stream")
+def release_stream():
+    global camera
+    if camera:
+        camera.release()
+        camera = None
+    return "Stream released", 200
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    import numpy as np  # used in fallback error image creation
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=False)
